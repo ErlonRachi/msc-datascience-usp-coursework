@@ -1,0 +1,108 @@
+This summary documents our collaborative process in completing the **MAF Adtech Campaign Effectiveness Analysis**. It outlines the strategic approach taken to transform raw log data into a high-performance, automated ranking engine for an in-app offerwall.
+
+---
+
+# **Project Summary: Offerwall Optimization & Ranking Strategy**
+
+### **1. Objectives**
+The primary objective of this project was to transition from a static offerwall (where offers might be ordered arbitrarily or manually) to a **dynamic, performance-driven model**. 
+* **Primary Metric:** Maximize **Expected Publisher Revenue per Impression ($eRPM$)**.
+* **Secondary Goal:** Maintain user experience by ensuring offer quality and diversity, preventing "offerwall fatigue."
+
+### **2. The Challenge: Key Questions Addressed**
+To complete the assignment, we had to answer several critical business and technical questions:
+* **Position Impact:** How much does an offer’s rank affect its visibility (CTR) versus its conversion quality (CR)?
+* **Revenue Inefficiency:** Are there high-performing offers currently "hidden" at the bottom of the wall?
+* **Temporal Patterns:** Does user behavior change based on the day of the week or specific Ad Units?
+* **Ranking Logic:** What mathematical formula should determine the order of offers to ensure the highest yield?
+* **Data Integrity:** How do we handle duplicate clicks, "impossible" timestamps, and missing revenue data?
+
+### **3. The Thought Process (Methodology)**
+We followed a standard Data Engineering and Analytics lifecycle:
+
+1.  **Data Health & Treatment:** We recognized that raw logs are noisy. We implemented logic to deduplicate clicks and events to ensure we only count "unique" user journeys. We used `COALESCE` and `SAFE_DIVIDE` to prevent mathematical errors in the presence of null values.
+2.  **The Funnel Framework:** We modeled the offerwall as a three-stage funnel: **Visibility $\rightarrow$ Interest $\rightarrow$ Action**. This allowed us to isolate *System Bias* (positioning) from *User Intent* (conversion).
+3.  **Segmentation:** Instead of looking at individual offers, we grouped positions into "Visibility Tiers" (e.g., Top 10, 11-50, etc.) to identify the "High-Impact Zone" vs. the "Long Tail."
+4.  **De-biasing:** The core insight was that CTR is a product of position, but CR is a product of offer quality. Our strategy focuses on moving high-CR offers into high-visibility positions.
+
+### **4. Conclusions & Strategy**
+* **Position Bias is Dominant:** The top 5–10 positions control the vast majority of revenue due to visibility. Moving an offer down the list results in a steep decay in clicks.
+* **Intent is Stable:** User intent (CR) does not decay as steeply as visibility. This means "hidden gems" exist at the bottom of the wall—offers that convert very well but aren't being seen.
+* **The Ranking Formula:** We concluded that offers should be ranked by $Score = pCTR \times pCR \times Payout$, allowing us to predict the revenue value of every single impression.
+* **Operational Guardrails:** Success requires more than just math; we must implement "Diversity Caps" and "Quality Floors" to keep the wall healthy and engaging for the long term.
+
+---
+
+# **Technical Appendix: SQL Library**
+
+Below are the code snippets developed during this project, organized by their role in the analysis.
+
+#### **Snippet 1: Basic Performance by Time Slice**
+* **Description:** This query extracts the day of the week and hour from timestamps to identify "Prime Time" and weekend performance spikes.
+```sql
+SELECT 
+  adunit_id,
+  FORMAT_TIMESTAMP('%A', timestamp) as day_name,
+  EXTRACT(HOUR FROM timestamp) as hour_of_day,
+  COUNT(*) as impressions,
+  SAFE_DIVIDE(COUNT(clicks), COUNT(impressions)) as CTR
+FROM `myappfreeapp.public_exports.impressions`
+GROUP BY 1, 2, 3
+```
+
+#### **Snippet 2: Unique Funnel with Timestamps**
+* **Description:** This query uses `ROW_NUMBER()` to deduplicate clicks. It joins impressions, clicks, and events while carrying over timestamps to calculate the "latency" (time-to-action) for each user.
+```sql
+WITH unique_clicks AS (
+  SELECT * EXCEPT(row_num) FROM (
+    SELECT impression_id, click_id, timestamp AS click_timestamp,
+    ROW_NUMBER() OVER(PARTITION BY impression_id ORDER BY timestamp ASC) as row_num
+    FROM `myappfreeapp.public_exports.clicks_2025_05`
+  ) WHERE row_num = 1
+)
+SELECT i.impression_id, i.timestamp, c.click_timestamp, e.timestamp as event_timestamp
+FROM `myappfreeapp.public_exports.impressions_2025_05` i
+LEFT JOIN unique_clicks c ON i.impression_id = c.impression_id
+LEFT JOIN `myappfreeapp.public_exports.events_2025_05` e ON c.click_id = e.click_id
+```
+
+#### **Snippet 3: The Integrated Analysis (The "Master Query")**
+* **Description:** The final comprehensive query. It groups positions into four visibility tiers, deduplicates the funnel, calculates all core metrics (CTR, CR, eRPM), and measures average time-to-convert per day of the week.
+```sql
+WITH granular_funnel AS (
+    SELECT 
+        i.position,
+        FORMAT_TIMESTAMP('%A', i.timestamp) AS day_of_week,
+        CASE 
+            WHEN i.position BETWEEN 1 AND 10 THEN 'Group 1 (1-10)'
+            WHEN i.position BETWEEN 11 AND 50 THEN 'Group 2 (11-50)'
+            WHEN i.position BETWEEN 51 AND 100 THEN 'Group 3 (51-100)'
+            ELSE 'Group 5 (Remaining)' 
+        END AS visibility_group,
+        IF(c.click_id IS NOT NULL, 1, 0) AS is_click,
+        IF(e.click_id IS NOT NULL, 1, 0) AS is_event,
+        COALESCE(e.publisher_payout, 0) AS revenue
+    FROM `myappfreeapp.public_exports.impressions_2025_05` i
+    LEFT JOIN `unique_clicks_cte` c ON i.impression_id = c.impression_id
+    LEFT JOIN `unique_events_cte` e ON c.click_id = e.click_id
+)
+SELECT 
+    day_of_week, visibility_group,
+    SAFE_DIVIDE(SUM(is_click), COUNT(*)) AS CTR,
+    SAFE_DIVIDE(SUM(is_event), SUM(is_click)) AS CR,
+    SAFE_DIVIDE(SUM(revenue), COUNT(*)) * 1000 AS eRPM
+FROM granular_funnel
+GROUP BY 1, 2
+```
+
+#### **Snippet 4: Visibility vs. Efficiency (Looker Prep)**
+* **Description:** This query was designed specifically for the **Dual-Axis Chart** in Looker, comparing total Impression volume (Bars) against eRPM efficiency (Line).
+```sql
+SELECT 
+    position,
+    COUNT(*) AS impressions,
+    (SUM(publisher_payout) / COUNT(*)) * 1000 AS eRPM
+FROM `myappfreeapp.public_exports.joined_master_table`
+GROUP BY 1
+ORDER BY 1 ASC
+```
